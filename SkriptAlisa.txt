@@ -1,0 +1,414 @@
+# sales_forecaster.py
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from matplotlib.dates import DateFormatter
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import adfuller
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from matplotlib.backends.backend_pdf import PdfPages
+import os
+import subprocess
+import logging
+import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, List, Tuple, Optional, Union
+from pathlib import Path
+import warnings
+
+# === Отключение предупреждений ===
+warnings.filterwarnings("ignore", module="statsmodels")
+warnings.filterwarnings("ignore", module="pandas")
+
+# === Настройка логирования ===
+logging.basicConfig(
+    filename="forecast_log.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+def setup_config() -> Dict:
+    """Настройка конфигурации программы."""
+    base_path = Path(r"D:\Rossko\Documents\Братск филиал\Стратегия\2025\Проект АСУП")
+    
+    if not base_path.exists():
+        msg = f"Папка не найдена: {base_path}"
+        logging.critical(msg)
+        raise FileNotFoundError(msg)
+    
+    today = datetime.today()
+    return {
+        "data_path": base_path / "АСУП прогноз 2025 (002).xlsx",
+        "today": today,
+        "output_excel": base_path / f"Прогноз({today.strftime('%Y-%m-%d')}).xlsx",
+        "output_pdf": base_path / f"Графики_{today.strftime('%Y-%m-%d')}.pdf",
+        "group_cols": ["Филиал", "Менеджер"],
+        "min_history_points": 1,
+        "auto_arima": True,
+        "default_arima_order": (1, 1, 1),
+        "seasonal": False,
+        "enforce_stationarity": True,
+        "enforce_invertibility": True,
+        "freq": "MS"
+    }
+
+def check_files(config: Dict) -> None:
+    """Проверка наличия файла."""
+    file_path = config["data_path"]
+    if not file_path.exists():
+        msg = f"Файл не найден: {file_path}"
+        logging.error(msg)
+        raise FileNotFoundError(msg)
+    logging.info("Проверка файлов пройдена успешно")
+
+def load_data(config: Dict) -> pd.DataFrame:
+    """Загрузка данных из Excel-файла."""
+    try:
+        data_path = config["data_path"]
+        
+        # Проверка доступных листов
+        from openpyxl import load_workbook
+        wb = load_workbook(data_path, read_only=True)
+        available_sheets = wb.sheetnames
+        logging.info(f"Доступные листы в Excel: {available_sheets}")
+        
+        # Загрузка данных с листа "Лист1"
+        df_sales = pd.read_excel(data_path, sheet_name="Лист1", header=0)
+        
+        # Логируем доступные колонки
+        logging.info(f"Доступные колонки в Excel: {df_sales.columns.tolist()}")
+        
+        # Логируем уникальные значения
+        for col in df_sales.columns:
+            try:
+                unique_count = df_sales[col].nunique(dropna=True)
+                logging.info(f"Колонка '{col}': уникальных значений = {unique_count}")
+            except Exception as e:
+                logging.warning(f"Ошибка при подсчете уникальных значений для '{col}': {e}")
+        
+        # Переименование колонок
+        if "Период" in df_sales.columns:
+            df_sales["Месяц"] = pd.to_datetime(df_sales["Период"], format="%d.%m.%Y %H:%M", errors='coerce')
+            df_sales = df_sales.drop(columns=["Период"])
+        else:
+            raise KeyError("Отсутствует колонка 'Период'")
+        
+        if "Итого" in df_sales.columns:
+            df_sales["Сумма реализации в руб"] = pd.to_numeric(df_sales["Итого"], errors='coerce')
+            df_sales = df_sales.drop(columns=["Итого"])
+        else:
+            raise KeyError("Отсутствует колонка 'Итого'")
+        
+        # Удаление пробелов и нормализация названий
+        df_sales.columns = df_sales.columns.str.strip()
+        
+        # Логируем колонки после переименования
+        logging.info(f"Колонки после нормализации: {df_sales.columns.tolist()}")
+        
+        logging.info(f"Загружено записей: {len(df_sales)}")
+        return df_sales
+    
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке данных: {e}")
+        raise
+
+def preprocess_data(df_sales: pd.DataFrame, config: Dict) -> pd.DataFrame:
+    """Предобработка и очистка данных."""
+    try:
+        # Проверка наличия ключевых колонок
+        required_columns = ["Месяц", "Сумма реализации в руб"]
+        missing_cols = [col for col in required_columns if col not in df_sales.columns]
+        if missing_cols:
+            logging.critical(f"Отсутствуют обязательные колонки: {missing_cols}")
+            raise KeyError(f"Отсутствуют обязательные колонки: {missing_cols}")
+        
+        # Обработка дат
+        df_sales = df_sales.dropna(subset=["Месяц"])
+        df_sales["Месяц"] = df_sales["Месяц"].dt.to_period("M").dt.start_time
+        
+        # Логируем уникальные месяцы
+        logging.info(f"Уникальные месяцы: {df_sales['Месяц'].nunique()}")
+        
+        # Сортировка и установка индекса
+        df_sales = df_sales.sort_values("Месяц").set_index("Месяц")
+        
+        # Добавление недостающих колонок
+        for col in config["group_cols"]:
+            if col not in df_sales.columns:
+                df_sales[col] = "Не определен"
+        
+        logging.info(f"Данные предобработаны. Осталось записей: {len(df_sales)}")
+        return df_sales
+    
+    except Exception as e:
+        logging.error(f"Ошибка при предобработке данных: {e}")
+        raise
+
+def calculate_date_params(config: Dict) -> Dict:
+    """Расчет параметров для текущего месяца."""
+    today = config["today"]
+    first_day = today.replace(day=1)
+    last_day_of_month = first_day + pd.offsets.MonthEnd(1)
+    days_total = (last_day_of_month - first_day).days + 1
+    days_passed = (today.date() - first_day.date()).days
+    return {
+        "first_day": first_day,
+        "last_day": last_day_of_month,
+        "days_total": days_total,
+        "days_passed": days_passed,
+        "days_remaining": days_total - days_passed
+    }
+
+def test_stationarity(series):
+    """Проверка стационарности временного ряда."""
+    result = adfuller(series.dropna())
+    return result[1] < 0.05
+
+def determine_differencing(series, max_d=2):
+    """Определение порядка дифференцирования."""
+    if test_stationarity(series):
+        return 0
+    diff1 = series.diff().dropna()
+    if test_stationarity(diff1):
+        return 1
+    if len(series) > 2 and max_d >= 2:
+        diff2 = diff1.diff().dropna()
+        if test_stationarity(diff2):
+            return 2
+    return 1
+
+def evaluate_sarimax_model(ts, order, seasonal_order, config: Dict):
+    """Оценка модели SARIMAX."""
+    try:
+        model = SARIMAX(
+            ts,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=config.get("enforce_stationarity", True),
+            enforce_invertibility=config.get("enforce_invertibility", True)
+        )
+        model_fit = model.fit(disp=False, maxiter=50, method='nm', cov_type='none')
+        return model_fit.aic, model_fit
+    except Exception as e:
+        logging.warning(f"Ошибка при обучении SARIMAX: {e}")
+        return float('inf'), None
+
+def auto_sarimax(ts, config: Dict):
+    """Автоматический подбор параметров SARIMAX."""
+    max_p = config.get("max_p", 2)
+    max_d = config.get("max_d", 2)
+    max_q = config.get("max_q", 2)
+    
+    # Если данных недостаточно — возвращаем None
+    if len(ts) < 2:
+        return None, None
+    
+    d = determine_differencing(ts, max_d)
+    best_score = float('inf')
+    best_params = None
+    best_model = None
+    
+    for p in range(max_p + 1):
+        for q in range(max_q + 1):
+            order = (p, d, q)
+            seasonal_order = (0, 1, 1, 12)
+            score, model = evaluate_sarimax_model(ts, order, seasonal_order, config)
+            if score < best_score:
+                best_score = score
+                best_params = (order, seasonal_order)
+                best_model = model
+    
+    return best_params or ((1, 1, 1), (0, 1, 1, 12)), best_model
+
+def process_group(data: Tuple) -> Optional[Dict]:
+    """Обработка группы данных и прогнозирование."""
+    group_key, group_df, config, date_params = data
+    try:
+        # Агрегация по месяцам
+        ts_monthly = group_df.groupby("Месяц")["Сумма реализации в руб"].sum().sort_index()
+        
+        # Проверка достаточности данных
+        if len(ts_monthly) < config["min_history_points"] or ts_monthly.sum() == 0:
+            return None
+            
+        today = config["today"]
+        last_month = ts_monthly.index[-1]
+        current_month_data = (last_month.year == today.year and last_month.month == today.month)
+        
+        ts_model = ts_monthly.iloc[:-1] if current_month_data else ts_monthly.copy()
+        
+        if len(ts_model) < 1:
+            return None
+
+        # Обучение модели
+        model = SARIMAX(ts_model, order=config["default_arima_order"])
+        model_fit = model.fit(disp=False, maxiter=50, method='nm', cov_type='none')
+        
+        # Прогноз
+        if model_fit:
+            forecast = model_fit.get_forecast(steps=1)
+            forecast_vals = forecast.predicted_mean.clip(lower=0)
+        else:
+            forecast_vals = pd.Series([ts_monthly.mean()], index=[ts_monthly.index[-1] + pd.DateOffset(months=1)])
+
+        # Расчет результатов
+        forecast_value = forecast_vals.iloc[0] if isinstance(forecast_vals, pd.Series) else forecast_vals[0]
+        fact_current_month = ts_monthly.iloc[-1] if current_month_data and not ts_monthly.empty else 0
+        fact_to_date = ts_monthly.iloc[:-1].sum() if current_month_data else ts_monthly.sum()
+
+        row = {}
+        for i, col in enumerate(config["group_cols"]):
+            try:
+                row[col] = group_key[i]
+            except IndexError:
+                row[col] = "Нет данных"
+
+        row.update({
+            "Факт (до начала месяца)": fact_to_date,
+            "Факт (текущий месяц)": fact_current_month,
+            "Прогноз (остаток месяца)": forecast_value,
+            "Итоговый прогноз": forecast_value,
+            "AIC": round(model_fit.aic, 2) if model_fit else float('inf'),
+            "Параметры модели": str(config["default_arima_order"]),
+        })
+
+        # Визуализация
+        fig, ax = plt.subplots(figsize=(12, 7))
+        ts_monthly.plot(ax=ax, label="Факт", marker="o", color='blue', linewidth=2)
+
+        forecast_dates = pd.date_range(start=today.replace(day=1) + pd.offsets.MonthEnd(1), periods=1, freq="MS")
+        forecast_series = pd.Series(forecast_vals, index=forecast_dates)
+        forecast_series.plot(ax=ax, label="Прогноз", linestyle="--", color='red', linewidth=2)
+
+        title = " | ".join(str(x) for x in group_key[:5])
+        model_info = f"AIC: {model_fit.aic:.2f}" if model_fit else "Простое среднее"
+        ax.set_title(f"{title}\n{model_info}", fontsize=11)
+        ax.set_xlabel("Дата")
+        ax.set_ylabel("Сумма реализации, руб.")
+        ax.legend()
+        ax.grid(True)
+        ax.xaxis.set_major_formatter(DateFormatter("%b %Y"))
+        ax.xaxis.set_tick_params(rotation=45, labelsize=10)
+        plt.tight_layout()
+        plt.close(fig)
+
+        sheet_name = re.sub(r'[\\/*?:"<>|]', "", str(group_key[-1]))[:31] if group_key else "Прогноз"
+        return {"row": row, "fig": fig, "sheet_name": sheet_name}
+    
+    except KeyError as ke:
+        logging.warning(f"Колонка не найдена: {ke}")
+        return None
+    except IndexError:
+        logging.warning(f"Невозможно получить данные для прогноза в группе {group_key}: недостаточно точек")
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка при обработке группы {group_key}: {e}")
+        return None
+
+def process_data_parallel(df_sales: pd.DataFrame, config: Dict, date_params: Dict) -> List[Dict]:
+    """Параллельная обработка групп с прогресс-баром."""
+    from tqdm import tqdm  # Для прогресс-бара
+    results = []
+    group_data = []
+    
+    # Проверка наличия целевой колонки
+    if "Сумма реализации в руб" not in df_sales.columns:
+        logging.critical("Отсутствует колонка 'Сумма реализации в руб'")
+        raise KeyError("Колонка 'Сумма реализации в руб' обязательна для прогноза")
+    
+    # Подготовка данных
+    for group_key, group_df in df_sales.groupby(config["group_cols"]):
+        group_data.append((group_key, group_df, config, date_params))
+    
+    # Параллельная обработка с прогресс-баром
+    with ProcessPoolExecutor(max_workers=min(4, os.cpu_count())) as executor:
+        futures = [executor.submit(process_group, data) for data in group_data]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Обработка групп"):
+            result = future.result()
+            if result:
+                results.append(result)
+    
+    logging.info(f"Обработано групп: {len(results)} из {len(group_data)}")
+    return results
+
+def save_results(results: List[Dict], config: Dict) -> None:
+    """Сохранение результатов в Excel и PDF."""
+    if not results:
+        logging.warning("Нет результатов для сохранения")
+        # Сохраняем минимальный Excel-файл с сообщением
+        wb = Workbook()
+        wb.remove(wb.active)
+        ws = wb.create_sheet(title="Сводный итог")
+        ws.append(["Нет данных для прогнозирования"])
+        wb.save(config["output_excel"])
+        return
+        
+    # Сохранение Excel
+    wb = Workbook()
+    wb.remove(wb.active)
+    df_all = pd.DataFrame([r["row"] for r in results])
+    summary_sheet = wb.create_sheet(title="Сводный итог")
+    for r in dataframe_to_rows(df_all, index=False, header=True):
+        summary_sheet.append(r)
+    
+    # Сохранение детальных листов
+    for result in results:
+        sheet_name = result["sheet_name"]
+        df_result = pd.DataFrame([result["row"]])
+        sheet = wb.create_sheet(title=sheet_name)
+        for r in dataframe_to_rows(df_result, index=False, header=True):
+            sheet.append(r)
+    
+    wb.save(config["output_excel"])
+    logging.info(f"Excel-файл сохранен: {config['output_excel']}")
+    
+    # Сохранение PDF с графиками
+    with PdfPages(config["output_pdf"]) as pdf:
+        for result in results:
+            try:
+                pdf.savefig(result["fig"])
+                plt.close(result["fig"])
+            except Exception as e:
+                logging.warning(f"Не удалось сохранить график для {result['sheet_name']}: {e}")
+    logging.info(f"PDF с графиками сохранен: {config['output_pdf']}")
+
+def main():
+    """Главная функция программы."""
+    try:
+        config = setup_config()
+        logging.info("Начало работы программы")
+        check_files(config)
+        
+        df_sales = load_data(config)
+        df_sales = preprocess_data(df_sales, config)
+        
+        date_params = calculate_date_params(config)
+        results = process_data_parallel(df_sales, config, date_params)
+        save_results(results, config)
+
+        if os.name == 'nt':
+            subprocess.Popen(['explorer', str(config["output_excel"])], shell=True)
+        elif os.name == 'posix':
+            subprocess.Popen(['xdg-open', str(config["output_excel"])], start_new_session=True)
+
+        logging.info("Программа завершена успешно")
+        print(f"Сохранено: {config['output_excel']}")
+        print(f"PDF с графиками: {config['output_pdf']}")
+        return 0
+    
+    except FileNotFoundError as e:
+        logging.critical(f"Файл не найден: {e}")
+        print(f"Файл не найден: {e}")
+        return 1
+    except Exception as e:
+        logging.critical(f"Критическая ошибка: {e}", exc_info=True)
+        print(f"Произошла ошибка: {e}")
+        return 1
+
+if __name__ == "__main__":
+    main()
